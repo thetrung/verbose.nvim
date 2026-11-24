@@ -33,23 +33,44 @@ local function strip_comment(line)
 end
 
 -- Parse grouped declarator list like: "a, b As Single, c As Integer = 0"
+-- Supports fixed/slice arrays ("arr(64) As Foo", "s() As Bar"), parameterized types ("t As Task(Hero)"),
+-- and inline struct initializers ("p = Hero With (.hp = 10) As Hero").
 -- Returns list of { name, type }
 local function parse_grouped_decls(spec)
   local out = {}
+  -- Strip balanced inline `With (...)` initializers so commas/parens inside don't confuse splitting,
+  -- while preserving any trailing `As Type` after the closing `)`.
+  local cleaned = spec:gsub("With%s*%b()", "")
+  -- If an unclosed multi-line `With (` remains at end of line, strip it.
+  cleaned = cleaned:gsub("%s+With%s*%(.*$", "")
+
   -- Split by commas outside parentheses
   local parts = {}
   local depth = 0
   local start = 1
-  for i = 1, #spec do
-    local ch = spec:sub(i, i)
+  for i = 1, #cleaned do
+    local ch = cleaned:sub(i, i)
     if ch == "(" then depth = depth + 1
     elseif ch == ")" then depth = math.max(0, depth - 1)
     elseif ch == "," and depth == 0 then
-      table.insert(parts, trim(spec:sub(start, i - 1)))
+      table.insert(parts, trim(cleaned:sub(start, i - 1)))
       start = i + 1
     end
   end
-  table.insert(parts, trim(spec:sub(start)))
+  table.insert(parts, trim(cleaned:sub(start)))
+
+  local function match_type_name(s)
+    -- Match `Task(Hero)`, `Hero()`, or `Hero`
+    local t = s:match("^([A-Za-z_][A-Za-z0-9_]*%s*%b())")
+    if t then return (t:gsub("%s+", "")) end
+    return s:match("^([A-Za-z_][A-Za-z0-9_]*)")
+  end
+
+  local function match_trailing_type(s)
+    local after_as = s:match("%s+As%s+(.+)$")
+    if not after_as then return nil end
+    return match_type_name(trim(after_as))
+  end
 
   local pending = {}
   for _, raw in ipairs(parts) do
@@ -58,12 +79,13 @@ local function parse_grouped_decls(spec)
     local left = eq_pos and trim(item:sub(1, eq_pos - 1)) or item
     local right = eq_pos and trim(item:sub(eq_pos + 1)) or ""
 
-    -- Type might be on `left` ("x As Integer") or on `right` after value ("x = 1 As Integer")
-    local name, ty = left:match("^([A-Za-z_][A-Za-z0-9_]*)%s*%(?[^)]*%)?%s+As%s+([A-Za-z_][A-Za-z0-9_%(%)]*)")
+    -- Type might be on `left` ("x As Integer", "x(10) As Task(Hero)") or on `right` after value ("x = 1 As Integer")
+    local name, after_as = left:match("^([A-Za-z_][A-Za-z0-9_]*)%s*%(?[^)]*%)?%s+As%s+(.+)$")
+    local ty = after_as and match_type_name(trim(after_as)) or nil
     if not name then
       name = left:match("^([A-Za-z_][A-Za-z0-9_]*)")
       if right ~= "" then
-        ty = right:match("%s+As%s+([A-Za-z_][A-Za-z0-9_%(%)]*)%s*$")
+        ty = match_trailing_type(right)
       end
     end
 
@@ -85,6 +107,53 @@ local function parse_grouped_decls(spec)
   return out
 end
 
+-- Helper to create a lexical block node inside a function/sub/test scope
+local function new_block(kind, start_line, end_line, parent)
+  local blk = {
+    kind = kind,
+    start_line = start_line,
+    end_line = end_line,
+    parent = parent,
+    vars = {},     -- list of { name, type, line, col, path, kind }
+    children = {},
+  }
+  if parent then
+    table.insert(parent.children, blk)
+  end
+  return blk
+end
+
+-- Return map of visible local variables (name -> var_info) at 1-based `lnum` inside `scope`.
+-- Respects lexical nesting (If/Else/While/For/Match/Case/With) and declaration line order.
+function M.visible_vars_at(scope, lnum)
+  local vars = {}
+  if not scope then return vars end
+
+  local function collect(blk)
+    if not blk then return end
+    if lnum < blk.start_line or lnum > blk.end_line then return end
+    for _, v in ipairs(blk.vars) do
+      if v.line <= lnum then
+        vars[v.name] = v
+      end
+    end
+    for _, child in ipairs(blk.children) do
+      if lnum >= child.start_line and lnum <= child.end_line then
+        collect(child)
+      end
+    end
+  end
+
+  if scope.root_block then
+    collect(scope.root_block)
+  else
+    for name, ty in pairs(scope.vars or {}) do
+      vars[name] = { name = name, type = ty, line = scope.start_line, col = 1, kind = "Dim" }
+    end
+  end
+  return vars
+end
+
 function M.parse_lines(lines, filepath)
   local entry = {
     path = filepath,
@@ -99,9 +168,85 @@ function M.parse_lines(lines, filepath)
 
   local pending_doc = {}
   local cur_struct = nil
+  local struct_dim_buf = nil -- { text = "...", chunks = { { raw, line } } } for multi-line Structure Dim
   local cur_enum = nil
   local cur_scope = nil
+  local block_stack = {}
   local open_withs = {}
+
+  local function flush_struct_dim()
+    if not cur_struct or not struct_dim_buf then return end
+    for _, decl in ipairs(parse_grouped_decls(struct_dim_buf.text)) do
+      local fline = struct_dim_buf.chunks[1].line
+      local fcol = 1
+      for _, ch in ipairs(struct_dim_buf.chunks) do
+        local pos = ch.raw:find("%f[%w_]" .. decl.name .. "%f[^%w_]")
+        if pos then
+          fline = ch.line
+          fcol = pos
+          break
+        end
+      end
+      table.insert(cur_struct.fields, {
+        name = decl.name,
+        type = decl.type,
+        struct_name = cur_struct.name,
+        line = fline,
+        col = fcol,
+        path = filepath,
+      })
+    end
+    struct_dim_buf = nil
+  end
+
+  local function current_block()
+    return block_stack[#block_stack]
+  end
+
+  local function push_block(kind, lnum)
+    local parent = current_block()
+    local blk = new_block(kind, lnum, #lines, parent)
+    table.insert(block_stack, blk)
+    return blk
+  end
+
+  local function pop_block(lnum, expected_kind)
+    if #block_stack <= 1 then return nil end
+    local top = block_stack[#block_stack]
+    if expected_kind and top.kind ~= expected_kind then
+      -- Search downward in case an unclosed nested block sits above
+      for i = #block_stack, 2, -1 do
+        if block_stack[i].kind == expected_kind then
+          while #block_stack >= i do
+            local b = table.remove(block_stack)
+            b.end_line = lnum
+          end
+          return top
+        end
+      end
+      return nil
+    end
+    table.remove(block_stack)
+    top.end_line = lnum
+    return top
+  end
+
+  local function add_scope_var(name, ty, lnum, raw_line, kind)
+    if not cur_scope then return end
+    cur_scope.vars[name] = ty
+    local blk = current_block()
+    if blk then
+      local col = raw_line and (raw_line:find("%f[%w_]" .. name .. "%f[^%w_]") or 1) or 1
+      table.insert(blk.vars, {
+        name = name,
+        type = ty,
+        line = lnum,
+        col = col,
+        path = filepath,
+        kind = kind or "Dim",
+      })
+    end
+  end
 
   for lnum, raw_line in ipairs(lines) do
     local trimmed = trim(raw_line)
@@ -119,8 +264,9 @@ function M.parse_lines(lines, filepath)
         table.insert(entry.includes, { raw = inc_path, line = lnum })
         pending_doc = {}
 
-      -- End Structure / End Enum / End Function / End Sub / End Test / End With
+      -- End Structure / End Enum / End Function / End Sub / End Test
       elseif code:match("^End%s+Structure%s*$") then
+        flush_struct_dim()
         cur_struct = nil
         pending_doc = {}
       elseif code:match("^End%s+Enum%s*$") then
@@ -128,31 +274,38 @@ function M.parse_lines(lines, filepath)
         pending_doc = {}
       elseif code:match("^End%s+Function%s*$") or code:match("^End%s+Sub%s*$") or code:match("^End%s+Test%s*$") then
         if cur_scope then
+          while #block_stack > 0 do
+            local b = table.remove(block_stack)
+            b.end_line = lnum
+          end
+          while #open_withs > 0 do
+            local w = table.remove(open_withs)
+            w.end_line = lnum
+          end
           cur_scope.end_line = lnum
           table.insert(entry.scopes, cur_scope)
           cur_scope = nil
-          open_withs = {}
-        end
-        pending_doc = {}
-      elseif code:match("^End%s+With%s*$") then
-        if #open_withs > 0 then
-          local w = table.remove(open_withs)
-          w.end_line = lnum
         end
         pending_doc = {}
 
-      -- Inside Structure: fields
+      -- Inside Structure: fields (supports multi-line trailing-comma Dim declarations)
       elseif cur_struct then
-        local fspec = code:match("^Dim%s+(.+)$")
-        if fspec then
-          for _, decl in ipairs(parse_grouped_decls(fspec)) do
-            table.insert(cur_struct.fields, {
-              name = decl.name,
-              type = decl.type,
-              line = lnum,
-              col = (raw_line:find(decl.name, 1, true) or 1),
-              path = filepath,
-            })
+        if struct_dim_buf then
+          struct_dim_buf.text = struct_dim_buf.text .. " " .. code
+          table.insert(struct_dim_buf.chunks, { raw = raw_line, line = lnum })
+          if not code:match(",%s*$") then
+            flush_struct_dim()
+          end
+        else
+          local fspec = code:match("^Dim%s+(.+)$")
+          if fspec then
+            struct_dim_buf = {
+              text = fspec,
+              chunks = { { raw = raw_line, line = lnum } },
+            }
+            if not fspec:match(",%s*$") then
+              flush_struct_dim()
+            end
           end
         end
         pending_doc = {}
@@ -176,6 +329,76 @@ function M.parse_lines(lines, filepath)
         end
         pending_doc = {}
 
+      -- Inside a function/sub/test scope: track nested blocks, With, For, Dim, Static
+      elseif cur_scope then
+        if code:match("^End%s+With%s*$") then
+          if #open_withs > 0 then
+            local w = table.remove(open_withs)
+            w.end_line = lnum
+          end
+          pop_block(lnum, "with")
+        elseif code:match("^End%s+If%s*$") then
+          pop_block(lnum, "if")
+        elseif code:match("^End%s+While%s*$") then
+          pop_block(lnum, "while")
+        elseif code:match("^End%s+For%s*$") or code:match("^Next%f[^%w_]") or code == "Next" then
+          pop_block(lnum, "for")
+        elseif code:match("^End%s+Match%s*$") or code:match("^End%s+Select%s*$") then
+          if current_block() and current_block().kind == "case" then
+            pop_block(lnum, "case")
+          end
+          pop_block(lnum, "match")
+        elseif code:match("^ElseIf%s+.+%s+Then%s*$") or code:match("^Else%s*$") then
+          if current_block() and current_block().kind == "if" then
+            pop_block(lnum - 1, "if")
+          end
+          push_block("if", lnum)
+        elseif code:match("^If%s+.+%s+Then%s*$") then
+          push_block("if", lnum)
+        elseif code:match("^While%s+") then
+          push_block("while", lnum)
+        elseif code:match("^For%s+") then
+          push_block("for", lnum)
+          local fvar = code:match("^For%s+([A-Za-z_][A-Za-z0-9_]*)%s*=")
+          if fvar then
+            add_scope_var(fvar, "Integer", lnum, raw_line, "For")
+          end
+        elseif code:match("^Match%s+") or code:match("^Select%s+Case%s+") then
+          push_block("match", lnum)
+        elseif code:match("^Case%s+") then
+          -- Only push a lexical block for multi-line Case (not single-line `Case 0 Then Return b`)
+          local is_single_line = code:match("%s+Then%s+.+$") ~= nil
+          if not is_single_line then
+            if current_block() and current_block().kind == "case" then
+              pop_block(lnum - 1, "case")
+            end
+            push_block("case", lnum)
+          end
+        elseif code:match("^With%s+[^%(]") then
+          local target = trim(code:sub(5))
+          local wb = { start_line = lnum, end_line = #lines, target = target }
+          table.insert(cur_scope.with_blocks, wb)
+          table.insert(open_withs, wb)
+          push_block("with", lnum)
+        elseif code:match("^Volatile%s+Dim%s+") or code:match("^Dim%s+") then
+          local dspec = code:gsub("^Volatile%s+", ""):gsub("^Dim%s+", "")
+          for _, decl in ipairs(parse_grouped_decls(dspec)) do
+            add_scope_var(decl.name, decl.type, lnum, raw_line, "Dim")
+          end
+        elseif code:match("^Public%s+Volatile%s+Static%s+")
+            or code:match("^Private%s+Volatile%s+Static%s+")
+            or code:match("^Public%s+Static%s+")
+            or code:match("^Private%s+Static%s+")
+            or code:match("^Volatile%s+Static%s+")
+            or code:match("^Static%s+") then
+          local sspec = code:gsub("^Public%s+", ""):gsub("^Private%s+", ""):gsub("^Volatile%s+", ""):gsub("^Static%s+", "")
+          sspec = sspec:gsub("%s+At%s+.+$", "")
+          for _, decl in ipairs(parse_grouped_decls(sspec)) do
+            add_scope_var(decl.name, decl.type, lnum, raw_line, "Static")
+          end
+        end
+        pending_doc = {}
+
       else
         -- Structure Name
         local vis, sname = code:match("^(Public)%s+Structure%s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -192,6 +415,7 @@ function M.parse_lines(lines, filepath)
             doc = doc,
             fields = {},
           }
+          struct_dim_buf = nil
           entry.structs[sname] = cur_struct
           table.insert(entry.symbols, cur_struct)
           pending_doc = {}
@@ -287,21 +511,25 @@ function M.parse_lines(lines, filepath)
               }
               entry.functions[fname] = fn
               table.insert(entry.symbols, fn)
-              cur_scope = { start_line = lnum, end_line = #lines, vars = {}, with_blocks = {} }
-              for _, p in ipairs(plist) do
-                cur_scope.vars[p.name] = p.type
-              end
+              local root_blk = new_block("fn", lnum, #lines, nil)
+              cur_scope = { start_line = lnum, end_line = #lines, vars = {}, root_block = root_blk, with_blocks = {} }
+              block_stack = { root_blk }
               open_withs = {}
+              for _, p in ipairs(plist) do
+                add_scope_var(p.name, p.type, lnum, raw_line, "Param")
+              end
             end
             pending_doc = {}
 
           -- Test "name"
           elseif code:match('^Test%s+"') then
-            cur_scope = { start_line = lnum, end_line = #lines, vars = {}, with_blocks = {} }
+            local root_blk = new_block("test", lnum, #lines, nil)
+            cur_scope = { start_line = lnum, end_line = #lines, vars = {}, root_block = root_blk, with_blocks = {} }
+            block_stack = { root_blk }
             open_withs = {}
             pending_doc = {}
 
-          -- Static globals / locals
+          -- Top-level Static globals
           elseif code:match("^Public%s+Volatile%s+Static%s+")
               or code:match("^Private%s+Volatile%s+Static%s+")
               or code:match("^Public%s+Static%s+")
@@ -322,30 +550,9 @@ function M.parse_lines(lines, filepath)
                 path = filepath,
                 doc = doc,
               }
-              if cur_scope then
-                cur_scope.vars[decl.name] = decl.type
-              else
-                entry.statics[decl.name] = st
-                table.insert(entry.symbols, st)
-              end
+              entry.statics[decl.name] = st
+              table.insert(entry.symbols, st)
             end
-            pending_doc = {}
-
-          -- Local Dim inside a scope
-          elseif cur_scope and (code:match("^Volatile%s+Dim%s+") or code:match("^Dim%s+")) then
-            local dspec = code:gsub("^Volatile%s+", ""):gsub("^Dim%s+", "")
-            dspec = dspec:gsub("%s+With%s*%(.*$", "")
-            for _, decl in ipairs(parse_grouped_decls(dspec)) do
-              cur_scope.vars[decl.name] = decl.type
-            end
-            pending_doc = {}
-
-          -- With <lvalue> block inside a scope
-          elseif cur_scope and code:match("^With%s+[^%(]") then
-            local target = trim(code:sub(5))
-            local wb = { start_line = lnum, end_line = #lines, target = target }
-            table.insert(cur_scope.with_blocks, wb)
-            table.insert(open_withs, wb)
             pending_doc = {}
 
           else
@@ -356,7 +563,12 @@ function M.parse_lines(lines, filepath)
     end
   end
 
+  flush_struct_dim()
   if cur_scope then
+    while #block_stack > 0 do
+      local b = table.remove(block_stack)
+      b.end_line = #lines
+    end
     cur_scope.end_line = #lines
     table.insert(entry.scopes, cur_scope)
   end

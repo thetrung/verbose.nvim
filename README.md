@@ -5,13 +5,13 @@ Full-featured **Neovim** plugin for **[VerBose-Lang](https://github.com/thetrung
 - **Tree-sitter Grammar & Queries** (`tree-sitter-verbose/` + `queries/verbose/{highlights,locals,folds,indents}.scm`) with pre-generated `parser.c` (compiles in <1s with `clang`/`cc` — no Node or `tree-sitter-cli` required) plus a Vim regex syntax fallback (`syntax/verbose.vim`).
 - **Zero-Dependency In-Process LSP (`verbose_ls`)** with **recursive `Include`-graph caching** (mtime-invalidated across local files, `src/`, `std/`, `.vpkg/include/`, and `verbose.toml`):
   - Context-aware **auto-completion** (works with `blink.cmp`, `nvim-cmp`, LazyVim, and built-in `omnifunc`):
-    - Struct `.field` completion (`ball.pos.`, `particles(i).`)
-    - Zero-copy `With <lvalue> ... End With` bare `.field` completion
+    - Nested struct `.field` chains (`ship.tf.pos.`, `particles(i).`, `(Await job).tf.pos.`)
+    - Nested `With <lvalue>` blocks (`With .tf` → `With .pos`, `.tf.pos.`) and nested inline `Type With ( ... )` initializers
+    - Lexical block scoping (`If`/`Else`/`For`/`While`/`Match`) with shadowing & `For` loop variables
     - `Enum.` member & unqualified enum member completion
     - `Include "..."` file path completion
     - Included functions, subs, C `Declare`s, structs, enums, statics, locals, types, builtins & keywords
-  - **Go-to-definition (`gd`)** across transitively `Include`d files and `Include "..."` paths
-  - **Hover (`K`)** with signatures, struct field layouts, enum values, and doc comments
+  - **Go-to-definition (`gd`)** & **Hover (`K`)** across transitively `Include`d files, nested struct fields (`ship.tf.pos.z`, `.x` in `With`), locals, and `Include "..."` paths
   - **Document symbols** outline & **Signature help** parameter hints
   - **Live Compiler Diagnostics** via `verbose --emit-only` on open & save
 - **Built-in VerBose Compiler Installer (`:VerboseInstall`)**: Downloads the latest platform release binary directly from [thetrung/verbose-lang Releases](https://github.com/thetrung/verbose-lang/releases/latest) (Linux x86-64/arm64, macOS arm64, Windows x86-64) and compiles the Tree-sitter parser.

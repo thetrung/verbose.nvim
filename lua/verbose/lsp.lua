@@ -85,10 +85,107 @@ local function find_scope_at(entry, lnum)
   return nil
 end
 
--- Resolve the type of a simple expression like `ball`, `particles(i)`, `ball.pos`
-local function resolve_expr_type(expr, scope, graph)
+-- Strip comments from a line while respecting double-quoted strings
+local function strip_line_comment(line)
+  local in_str = false
+  local i = 1
+  local n = #line
+  while i <= n do
+    local ch = line:sub(i, i)
+    if ch == '"' then
+      in_str = not in_str
+    elseif ch == "\\" and in_str then
+      i = i + 1
+    elseif ch == "'" and not in_str then
+      return line:sub(1, i - 1)
+    end
+    i = i + 1
+  end
+  return line
+end
+
+-- Walk struct fields starting from `base_ty` along `parts[start_idx .. #parts]`
+local function walk_struct_fields(base_ty, parts, start_idx, graph)
+  local ty = base_ty
+  local last_field = nil
+  for i = start_idx, #parts do
+    local st = ty and graph.structs[ty]
+    if not st then return nil, nil end
+    local next_ty = nil
+    for _, f in ipairs(st.fields) do
+      if f.name == parts[i] then
+        next_ty = f.type:gsub("%(%)$", "")
+        last_field = f
+        break
+      end
+    end
+    if not next_ty then return nil, nil end
+    ty = next_ty
+  end
+  return ty, last_field
+end
+
+-- Resolve the type of an expression like `ball`, `particles(i).pos`, `.transform.pos`, or `(Await taskVar).pos`
+local function resolve_expr_type(expr, visible_vars, graph, with_base_ty)
   local cur = expr:gsub("^%s+", ""):gsub("%s+$", "")
-  -- Strip array index suffix: `particles(i)` -> `particles`
+  -- Strip balanced outer parentheses, e.g. `(Await t)`
+  while cur:sub(1, 1) == "(" and cur:sub(-1) == ")" do
+    local inner = cur:sub(2, -2)
+    local depth = 0
+    local balanced = true
+    for i = 1, #inner do
+      local ch = inner:sub(i, i)
+      if ch == "(" then depth = depth + 1
+      elseif ch == ")" then
+        depth = depth - 1
+        if depth < 0 then balanced = false break end
+      end
+    end
+    if balanced and depth == 0 then
+      cur = inner:gsub("^%s+", ""):gsub("%s+$", "")
+    else
+      break
+    end
+  end
+
+  -- Handle `Await <expr>` unwrapping `Task(T)` -> `T`
+  local await_inner = cur:match("^Await%s+(.+)$")
+  if await_inner then
+    local inner_ty = resolve_expr_type(await_inner, visible_vars, graph, with_base_ty)
+    if inner_ty then
+      local unwrapped = inner_ty:match("^Task%((.+)%)$")
+      return unwrapped and unwrapped:gsub("%(%)$", "") or inner_ty
+    end
+    return nil
+  end
+
+  -- Handle `(Await <expr>).field.chain`
+  local paren_await, rest_chain = cur:match("^%((Await%s+[^%)]+)%)%.(.+)$")
+  if paren_await and rest_chain then
+    local base_ty = resolve_expr_type(paren_await, visible_vars, graph, with_base_ty)
+    if not base_ty then return nil end
+    local parts = {}
+    for seg in rest_chain:gmatch("[^%.]+") do
+      table.insert(parts, (seg:gsub("%b()", "")))
+    end
+    local final_ty = walk_struct_fields(base_ty, parts, 1, graph)
+    return final_ty
+  end
+
+  -- Leading dot `.field.chain` resolved relative to enclosing `With` target type
+  if cur:sub(1, 1) == "." then
+    if not with_base_ty then return nil end
+    local tail = cur:sub(2)
+    if tail == "" then return with_base_ty end
+    local parts = {}
+    for seg in tail:gmatch("[^%.]+") do
+      table.insert(parts, (seg:gsub("%b()", "")))
+    end
+    local final_ty = walk_struct_fields(with_base_ty, parts, 1, graph)
+    return final_ty
+  end
+
+  -- Rooted chain: `particles(i).pos.x`
   local parts = {}
   for seg in cur:gmatch("[^%.]+") do
     local base = seg:gsub("%b()", "")
@@ -98,8 +195,8 @@ local function resolve_expr_type(expr, scope, graph)
 
   local root_name = parts[1]
   local ty = nil
-  if scope and scope.vars[root_name] then
-    ty = scope.vars[root_name]
+  if visible_vars and visible_vars[root_name] then
+    ty = visible_vars[root_name].type
   elseif graph.statics[root_name] then
     ty = graph.statics[root_name].type
   elseif graph.functions[root_name] then
@@ -108,33 +205,60 @@ local function resolve_expr_type(expr, scope, graph)
   if not ty then return nil end
   ty = ty:gsub("%(%)$", "")
 
-  for i = 2, #parts do
-    local st = graph.structs[ty]
-    if not st then return nil end
-    local next_ty = nil
-    for _, f in ipairs(st.fields) do
-      if f.name == parts[i] then
-        next_ty = f.type:gsub("%(%)$", "")
-        break
-      end
-    end
-    if not next_ty then return nil end
-    ty = next_ty
-  end
-  return ty
+  if #parts == 1 then return ty end
+  local final_ty = walk_struct_fields(ty, parts, 2, graph)
+  return final_ty
 end
 
--- Determine innermost `With <target>` struct type at 1-based `lnum`
-local function resolve_with_type(scope, lnum, graph)
+-- Determine innermost `With <target>` struct type at 1-based `lnum`,
+-- chaining nested `With .sub` blocks from outermost to innermost.
+local function resolve_with_type(scope, lnum, graph, visible_vars)
   if not scope then return nil end
-  local best = nil
+  local cur_ty = nil
   for _, wb in ipairs(scope.with_blocks or {}) do
     if lnum > wb.start_line and lnum < wb.end_line then
-      best = wb
+      cur_ty = resolve_expr_type(wb.target, visible_vars, graph, cur_ty)
     end
   end
-  if not best then return nil end
-  return resolve_expr_type(best.target, scope, graph)
+  return cur_ty
+end
+
+-- Scan backward from (lnum, col0) to find an enclosing inline struct initializer:
+-- `TypeName With ( ... )` (supports single-line, multi-line, and arbitrarily nested initializers).
+local function resolve_inline_with_init_type(lines, lnum, col0, graph)
+  local min_line = math.max(1, lnum - 60)
+  local depth = 0
+  for ln = lnum, min_line, -1 do
+    local raw = lines[ln] or ""
+    local text = strip_line_comment(ln == lnum and raw:sub(1, col0) or raw)
+    local in_str = false
+    for i = #text, 1, -1 do
+      local ch = text:sub(i, i)
+      if ch == '"' then
+        in_str = not in_str
+      elseif not in_str then
+        if ch == ")" then
+          depth = depth + 1
+        elseif ch == "(" then
+          if depth == 0 then
+            local prefix = text:sub(1, i - 1)
+            local ty = prefix:match("([A-Za-z_][A-Za-z0-9_]*)%s+With%s*$")
+            if not ty and prefix:match("^%s*$") and ln > 1 then
+              local prev = strip_line_comment(lines[ln - 1] or "")
+              ty = prev:match("([A-Za-z_][A-Za-z0-9_]*)%s+With%s*$")
+            end
+            if ty and graph.structs[ty] then
+              return ty
+            end
+            return nil
+          else
+            depth = depth - 1
+          end
+        end
+      end
+    end
+  end
+  return nil
 end
 
 local function word_at(line, col0)
@@ -142,7 +266,38 @@ local function word_at(line, col0)
   local after = line:sub(col0 + 1)
   local left = before:match("([A-Za-z_][A-Za-z0-9_]*)$") or ""
   local right = after:match("^([A-Za-z0-9_]*)") or ""
-  return left .. right, before
+  local word_start = col0 - #left
+  return left .. right, line:sub(1, word_start)
+end
+
+-- Extract member receiver right before a trailing `.` in `prefix`.
+-- Returns kind ("with_chain" | "bare_dot" | "rooted" | nil), expr
+local function parse_dot_receiver(prefix)
+  -- 1. `(Await expr).` or `(Await expr).a.b.`
+  local paren_recv = prefix:match("(%([Aa]wait%s+[^%)]+%)%.?[A-Za-z0-9_%.%(%)]*)%.$")
+  if paren_recv then
+    return "rooted", paren_recv
+  end
+
+  -- 2. With-relative chain: `.pos.` or `.transform.pos.` preceded by non-ident/non-`)` or BOL
+  local wchain = prefix:match("[^A-Za-z0-9_%.%)](%.[A-Za-z_][A-Za-z0-9_%.%(%)]*)%.$")
+    or prefix:match("^%s*(%.[A-Za-z_][A-Za-z0-9_%.%(%)]*)%.$")
+  if wchain then
+    return "with_chain", wchain
+  end
+
+  -- 3. Bare `.` (inside `With` block or `Type With (...)`)
+  if prefix:match("[^A-Za-z0-9_%.%)]%.$") or prefix:match("^%s*%.$") then
+    return "bare_dot", "."
+  end
+
+  -- 4. Rooted expression: `ship.transform.pos.` or `particles(i).`
+  local recv = prefix:match("([A-Za-z_][A-Za-z0-9_%.%(%)]*)%.$")
+  if recv then
+    return "rooted", recv
+  end
+
+  return nil, nil
 end
 
 -- Build LSP completion items
@@ -154,6 +309,7 @@ function M.compute_completions(uri, line0, col0)
   local line = lines[lnum] or ""
   local before = line:sub(1, col0)
   local scope = find_scope_at(graph.root, lnum)
+  local visible_vars = index.visible_vars_at(scope, lnum)
   local items = {}
 
   -- 1. Include "..." file completion
@@ -177,9 +333,47 @@ function M.compute_completions(uri, line0, col0)
     return items
   end
 
-  -- 2. Member completion: `expr.prefix` or bare `.prefix` inside With
-  local recv, _ = before:match("([A-Za-z_][A-Za-z0-9_%.%(%)]*)%.([A-Za-z0-9_]*)$")
-  if recv then
+  -- 2. Member completion: `(Await t).`, `.a.b.`, bare `.` (inline With(...) or With block), or `expr.prefix`
+  local before_ident = before:gsub("[A-Za-z0-9_]*$", "")
+  local dot_kind, recv = parse_dot_receiver(before_ident)
+  if dot_kind == "bare_dot" then
+    -- Prefer enclosing inline `Type With ( ... )` over outer `With <target>` block
+    local init_ty = resolve_inline_with_init_type(lines, lnum, col0, graph)
+    if init_ty and graph.structs[init_ty] then
+      for _, f in ipairs(graph.structs[init_ty].fields) do
+        table.insert(items, {
+          label = f.name,
+          kind = 5, -- Field
+          detail = "(" .. init_ty .. " With) " .. f.name .. " As " .. f.type,
+        })
+      end
+      return items
+    end
+    local wty = resolve_with_type(scope, lnum, graph, visible_vars)
+    if wty and graph.structs[wty] then
+      for _, f in ipairs(graph.structs[wty].fields) do
+        table.insert(items, {
+          label = f.name,
+          kind = 5, -- Field
+          detail = "(With " .. wty .. ") " .. f.name .. " As " .. f.type,
+        })
+      end
+      return items
+    end
+  elseif dot_kind == "with_chain" then
+    local wty = resolve_with_type(scope, lnum, graph, visible_vars)
+    local ty = resolve_expr_type(recv, visible_vars, graph, wty)
+    if ty and graph.structs[ty] then
+      for _, f in ipairs(graph.structs[ty].fields) do
+        table.insert(items, {
+          label = f.name,
+          kind = 5, -- Field
+          detail = f.name .. " As " .. f.type,
+        })
+      end
+      return items
+    end
+  elseif dot_kind == "rooted" and recv then
     -- Enum.Member?
     local en = graph.enums[recv]
     if en then
@@ -192,8 +386,9 @@ function M.compute_completions(uri, line0, col0)
       end
       return items
     end
-    -- Struct variable field completion
-    local ty = resolve_expr_type(recv, scope, graph)
+    -- Struct variable / nested field / (Await t) completion
+    local wty = resolve_with_type(scope, lnum, graph, visible_vars)
+    local ty = resolve_expr_type(recv, visible_vars, graph, wty)
     if ty and graph.structs[ty] then
       for _, f in ipairs(graph.structs[ty].fields) do
         table.insert(items, {
@@ -204,21 +399,9 @@ function M.compute_completions(uri, line0, col0)
       end
       return items
     end
-  elseif before:match("[^A-Za-z0-9_%.]%.([A-Za-z0-9_]*)$") or before:match("^%s*%.([A-Za-z0-9_]*)$") then
-    local wty = resolve_with_type(scope, lnum, graph)
-    if wty and graph.structs[wty] then
-      for _, f in ipairs(graph.structs[wty].fields) do
-        table.insert(items, {
-          label = f.name,
-          kind = 5, -- Field
-          detail = "(With " .. wty .. ") " .. f.name .. " As " .. f.type,
-        })
-      end
-      return items
-    end
   end
 
-  -- 3. General completion: locals, functions, structs, enums, unqualified enum members, statics, builtins, types, keywords
+  -- 3. General completion: in-scope locals, functions, structs, enums, unqualified enum members, statics, builtins, types, keywords
   local added = {}
   local function push(item)
     if not added[item.label] then
@@ -227,10 +410,8 @@ function M.compute_completions(uri, line0, col0)
     end
   end
 
-  if scope then
-    for vname, vtype in pairs(scope.vars) do
-      push({ label = vname, kind = 6, detail = "Dim " .. vname .. " As " .. vtype })
-    end
+  for vname, vinfo in pairs(visible_vars) do
+    push({ label = vname, kind = 6, detail = (vinfo.kind or "Dim") .. " " .. vname .. " As " .. vinfo.type })
   end
 
   for name, fn in pairs(graph.functions) do
@@ -299,6 +480,50 @@ function M.compute_completions(uri, line0, col0)
   return items
 end
 
+-- Resolve a member (struct field or enum member) or local variable under cursor
+local function resolve_cursor_target(lines, lnum, col0, scope, visible_vars, graph)
+  local line = lines[lnum] or ""
+  local word, before_word = word_at(line, col0)
+  if word == "" then return nil, "" end
+
+  local dot_kind, recv = parse_dot_receiver(before_word)
+  if dot_kind then
+    if dot_kind == "rooted" and graph.enums[recv] then
+      for _, m in ipairs(graph.enums[recv].members) do
+        if m.name == word then
+          return { kind = "enum_member", member = m }, word
+        end
+      end
+    end
+
+    local recv_ty = nil
+    if dot_kind == "bare_dot" then
+      recv_ty = resolve_inline_with_init_type(lines, lnum, #before_word, graph)
+        or resolve_with_type(scope, lnum, graph, visible_vars)
+    elseif dot_kind == "with_chain" then
+      local wty = resolve_with_type(scope, lnum, graph, visible_vars)
+      recv_ty = resolve_expr_type(recv, visible_vars, graph, wty)
+    elseif dot_kind == "rooted" then
+      local wty = resolve_with_type(scope, lnum, graph, visible_vars)
+      recv_ty = resolve_expr_type(recv, visible_vars, graph, wty)
+    end
+
+    if recv_ty and graph.structs[recv_ty] then
+      for _, f in ipairs(graph.structs[recv_ty].fields) do
+        if f.name == word then
+          return { kind = "field", struct_name = recv_ty, field = f }, word
+        end
+      end
+    end
+  end
+
+  if visible_vars[word] then
+    return { kind = "local", var = visible_vars[word] }, word
+  end
+
+  return nil, word
+end
+
 function M.compute_definition(uri, line0, col0)
   local path = uri_to_path(uri)
   local lines = get_lines_for_uri(uri)
@@ -318,13 +543,29 @@ function M.compute_definition(uri, line0, col0)
   end
 
   local graph = index.collect_graph(path, lines)
-  local word = word_at(line, col0)
+  local scope = find_scope_at(graph.root, lnum)
+  local visible_vars = index.visible_vars_at(scope, lnum)
+
+  local resolved, word = resolve_cursor_target(lines, lnum, col0, scope, visible_vars, graph)
   if word == "" then return nil end
 
-  local target = graph.functions[word]
-    or graph.structs[word]
-    or graph.enums[word]
-    or graph.statics[word]
+  local target = nil
+  if resolved then
+    if resolved.kind == "field" then
+      target = resolved.field
+    elseif resolved.kind == "enum_member" then
+      target = resolved.member
+    elseif resolved.kind == "local" then
+      target = resolved.var
+    end
+  end
+
+  if not target then
+    target = graph.functions[word]
+      or graph.structs[word]
+      or graph.enums[word]
+      or graph.statics[word]
+  end
 
   if not target and graph.enum_members[word] then
     target = graph.enum_members[word].member
@@ -345,13 +586,39 @@ function M.compute_hover(uri, line0, col0)
   local path = uri_to_path(uri)
   local lines = get_lines_for_uri(uri)
   local lnum = line0 + 1
-  local line = lines[lnum] or ""
   local graph = index.collect_graph(path, lines)
-  local word = word_at(line, col0)
+  local scope = find_scope_at(graph.root, lnum)
+  local visible_vars = index.visible_vars_at(scope, lnum)
+
+  local resolved, word = resolve_cursor_target(lines, lnum, col0, scope, visible_vars, graph)
   if word == "" then return nil end
 
   local md = {}
-  if graph.functions[word] then
+  if resolved and resolved.kind == "field" then
+    local f = resolved.field
+    table.insert(md, "```verbose\n(field) " .. resolved.struct_name .. "." .. f.name .. " As " .. f.type .. "\n```")
+    if f.path then
+      table.insert(md, "_Defined in `" .. vim.fs.basename(f.path) .. ":" .. f.line .. "`_")
+    end
+  elseif resolved and resolved.kind == "enum_member" then
+    local m = resolved.member
+    table.insert(md, "```verbose\n" .. m.enum_name .. "." .. m.name .. (m.value and (" = " .. m.value) or "") .. "\n```")
+    if m.path then
+      table.insert(md, "_Defined in `" .. vim.fs.basename(m.path) .. ":" .. m.line .. "`_")
+    end
+  elseif resolved and resolved.kind == "local" then
+    local v = resolved.var
+    table.insert(md, "```verbose\n(" .. (v.kind or "Dim") .. ") " .. v.name .. " As " .. v.type .. "\n```")
+    local base_ty = v.type:gsub("%(%)$", "")
+    local st = graph.structs[base_ty]
+    if st and #st.fields > 0 then
+      local fnames = {}
+      for _, f in ipairs(st.fields) do
+        table.insert(fnames, f.name .. ": " .. f.type)
+      end
+      table.insert(md, "Fields of `" .. base_ty .. "`: `" .. table.concat(fnames, ", ") .. "`")
+    end
+  elseif graph.functions[word] then
     local fn = graph.functions[word]
     table.insert(md, "```verbose\n" .. fn.sig .. "\n```")
     if fn.doc then table.insert(md, fn.doc) end
