@@ -1,0 +1,7 @@
+parser/
+node_modules/
+tree-sitter-verbose/build/
+tree-sitter-verbose/target/
+*.so
+*.dylib
+*.dll

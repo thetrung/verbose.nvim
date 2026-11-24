@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nvim-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim & C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang curl
+          curl -fsSL https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz -o /tmp/nvim.tar.gz
+          sudo tar -xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1
+          nvim --version | head -n 2
+
+      - name: Compile bundled Tree-sitter parser & run headless Neovim tests
+        run: |
+          bash scripts/build_parser.sh
+          nvim --headless -u NONE -l tests/run_tests.lua
